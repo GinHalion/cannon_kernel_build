@@ -253,9 +253,9 @@ jobs:
           release_name: "Cannon Kernel by GinHalion - ${{ steps.tag.outputs.tag }}"
           body: |
             Stock | KernelSU v0.9.5 LKM + Manager APK
-
+            
             构建环境: Ubuntu 22.04
-            构建时间: $(date)
+            
           draft: false
           prerelease: false
 
