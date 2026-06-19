@@ -1,0 +1,300 @@
+on:
+  workflow_dispatch:
+
+name: Cannon Kernel by GinHalion
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出 workflow 仓库（包含 build.sh）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装基础依赖
+        run: |
+          sudo sed -i 's|http://azure.archive.ubuntu.com|http://mirrors.edge.kernel.org|g' /etc/apt/sources.list
+          sudo apt update
+          sudo apt install -y \
+            git wget curl tar zip unzip make \
+            binutils bison flex libssl-dev bc libelf-dev \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            build-essential python3 python3-pip \
+            libncurses5-dev libncursesw5-dev pkg-config \
+            ccache gh lld xz-utils rsync \
+            libtinfo5 libdw-dev libslang2-dev libiberty-dev \
+            libunwind-dev libcap-dev libnuma-dev libbabeltrace-dev \
+            libtraceevent-dev libgmp-dev libmpfr-dev libmpc-dev \
+            libunwind8-dev libpci-dev libiberty-dev libzstd-dev \
+            dwarves
+
+      - name: 创建 /cannon 工作目录
+        run: |
+          sudo mkdir -p /cannon
+          sudo chown $USER:$USER /cannon
+          mkdir -p /cannon/cache
+
+      - name: Checkout kernel repo (public)
+        uses: actions/checkout@v4
+        with:
+          repository: 'GinHalion/android_kernel_xiaomi_cannon'
+          fetch-depth: 0
+          path: kernel_tmp
+
+      - name: Cache toolchains tarball
+        uses: actions/cache@v4
+        with:
+          path: /cannon/cache/toolchains.tar.gz
+          key: toolchains-ubuntu-22.04-v2
+          restore-keys: |
+            toolchains-ubuntu-22.04-
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: /cannon/.ccache
+          key: kernel-ccache-${{ github.sha }}
+          restore-keys: |
+            kernel-ccache-
+
+      - name: 移动 kernel 并设置工具链
+        run: |
+          set -ex
+          rm -rf /cannon/kernel
+          mkdir -p /cannon
+          mv kernel_tmp /cannon/kernel
+
+          download() {
+            url="$1"
+            out="$2"
+            echo "Downloading $url -> $out"
+            for i in {1..5}; do
+              if curl -fSL --connect-timeout 30 --max-time 300 -o "$out" "$url"; then
+                echo "Downloaded: $(ls -lh "$out" || true)"
+                return 0
+              fi
+              echo "Attempt $i failed, retrying in 5s..."
+              sleep 5
+            done
+            echo "ERROR: download failed for $url"
+            return 1
+          }
+
+          if [ -f /cannon/cache/toolchains.tar.gz ]; then
+            echo "Found cached toolchains tarball, extracting..."
+            tar -zxf /cannon/cache/toolchains.tar.gz -C /cannon
+            echo "Extraction done."
+          else
+            echo "No cached tarball found — downloading toolchains..."
+
+            download "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/a71fa4c09d7109d611ee63964fc9fca58fee38cd/clang-r450784d.tar.gz" /cannon/clang.tar.gz
+            mkdir -p /cannon/clang
+            tar -zxf /cannon/clang.tar.gz -C /cannon/clang
+            rm -f /cannon/clang.tar.gz
+
+            download "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" /cannon/gcc64.tar.gz
+            mkdir -p /cannon/gcc64
+            tar -zxf /cannon/gcc64.tar.gz -C /cannon/gcc64
+            rm -f /cannon/gcc64.tar.gz
+
+            download "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/android-12.1.0_r27.tar.gz" /cannon/gcc32.tar.gz
+            mkdir -p /cannon/gcc32
+            tar -zxf /cannon/gcc32.tar.gz -C /cannon/gcc32
+            rm -f /cannon/gcc32.tar.gz
+
+            if [ ! -d /cannon/Anykernel3 ]; then
+              download "https://github.com/GTian5418/AnyKernel3/archive/refs/heads/cannon.zip" /cannon/Anykernel3.zip
+              unzip -q /cannon/Anykernel3.zip -d /cannon/anykernel_src
+              mkdir -p /cannon/Anykernel3
+              mv /cannon/anykernel_src/*/* /cannon/Anykernel3/ 2>/dev/null || mv /cannon/anykernel_src/* /cannon/Anykernel3/
+              rm -rf /cannon/anykernel_src /cannon/Anykernel3.zip
+            fi
+
+            tar -zcf /cannon/cache/toolchains.tar.gz -C /cannon clang gcc64 gcc32 Anykernel3
+            echo "Packed toolchains to /cannon/cache/toolchains.tar.gz"
+          fi
+
+          echo "=== 工具链验证 ==="
+          ls -la /cannon/clang/bin/clang 2>/dev/null || echo "Clang not found"
+          ls -la /cannon/gcc64/bin/ 2>/dev/null | head -10
+          ls -la /cannon/gcc32/bin/ 2>/dev/null | head -10
+
+      - name: 修复工具链符号链接
+        run: |
+          set -ex
+          echo "=== 修复工具链符号链接 ==="
+
+          if [ -d /cannon/clang ]; then
+            if [ ! -f /cannon/clang/bin/clang ]; then
+              CLANG_BIN=$(find /cannon/clang -name "clang" -type f -executable | head -1)
+              if [ -n "$CLANG_BIN" ]; then
+                mkdir -p /cannon/clang/bin
+                ln -sf "$CLANG_BIN" /cannon/clang/bin/clang
+                ln -sf "$CLANG_BIN" /cannon/clang/bin/clang++
+                echo "Linked clang: $CLANG_BIN"
+              fi
+            fi
+
+            if [ ! -f /cannon/clang/bin/ld.lld ]; then
+              LLD_BIN=$(find /cannon/clang -name "ld.lld" -type f -executable | head -1)
+              if [ -n "$LLD_BIN" ]; then
+                mkdir -p /cannon/clang/bin
+                ln -sf "$LLD_BIN" /cannon/clang/bin/ld.lld
+                echo "Linked ld.lld: $LLD_BIN"
+              fi
+            fi
+          fi
+
+          for arch in gcc64 gcc32; do
+            if [ -d "/cannon/$arch" ]; then
+              echo "=== 处理 $arch ==="
+              TOOL_DIR="/cannon/$arch"
+              mkdir -p "$TOOL_DIR/bin"
+              find "$TOOL_DIR" -maxdepth 1 -type f -executable | while read -r exe; do
+                name=$(basename "$exe")
+                if [[ ! "$name" =~ \. ]]; then
+                  if [ ! -e "$TOOL_DIR/bin/$name" ]; then
+                    ln -sf "$exe" "$TOOL_DIR/bin/$name"
+                  fi
+                fi
+              done
+              if [[ "$arch" == "gcc64" ]]; then
+                if [ -f "$TOOL_DIR/bin/aarch64-linux-android-ld.gold" ]; then
+                  ln -sf "aarch64-linux-android-ld.gold" "$TOOL_DIR/bin/aarch64-linux-android-ld"
+                elif [ -f "$TOOL_DIR/bin/aarch64-linux-android-ld.bfd" ]; then
+                  ln -sf "aarch64-linux-android-ld.bfd" "$TOOL_DIR/bin/aarch64-linux-android-ld"
+                fi
+              elif [[ "$arch" == "gcc32" ]]; then
+                if [ -f "$TOOL_DIR/bin/arm-linux-androideabi-ld.gold" ]; then
+                  ln -sf "arm-linux-androideabi-ld.gold" "$TOOL_DIR/bin/arm-linux-androideabi-ld"
+                elif [ -f "$TOOL_DIR/bin/arm-linux-androideabi-ld.bfd" ]; then
+                  ln -sf "arm-linux-androideabi-ld.bfd" "$TOOL_DIR/bin/arm-linux-androideabi-ld"
+                fi
+              fi
+              echo "--- $arch/bin 内容 ---"
+              ls -la "$TOOL_DIR/bin/" | head -15
+            fi
+          done
+
+          export PATH="/cannon/clang/bin:/cannon/gcc64/bin:/cannon/gcc32/bin:$PATH"
+
+          echo "=== 工具验证 ==="
+          which clang && clang --version | head -1
+          which aarch64-linux-android-gcc && aarch64-linux-android-gcc --version | head -1
+          which arm-linux-androideabi-gcc && arm-linux-androideabi-gcc --version | head -1
+          which ld.lld && echo "ld.lld found"
+          which aarch64-linux-android-ld && echo "aarch64-linux-android-ld found"
+
+      - name: 复制并执行编译脚本
+        run: |
+          set -ex
+          cp build.sh /cannon/build.sh
+          chmod +x /cannon/build.sh
+
+          export PATH="/cannon/clang/bin:/cannon/gcc64/bin:/cannon/gcc32/bin:$PATH"
+
+          echo "=== 环境验证 ==="
+          env | grep -E "(PATH|CC|CROSS_COMPILE|ARCH)" || true
+
+          echo "=== 工具链位置 ==="
+          ls -la /cannon/clang/bin/ | grep -E "(clang|lld)" || true
+          ls -la /cannon/gcc64/bin/ | grep -E "(aarch64|gcc|ld)" | head -5 || true
+
+          echo "=== 执行编译 ==="
+          cd /cannon
+          timeout 14400 ./build.sh; exit_code=$?
+          if [ $exit_code -eq 124 ]; then
+            echo "::error::Build timed out (14400s)"
+          elif [ $exit_code -ne 0 ]; then
+            echo "::error::Build failed with exit code $exit_code"
+          fi
+          exit $exit_code
+
+      - name: 检查构建产物
+        run: |
+          echo "=== 检查构建产物 ==="
+          ls -la /cannon/*.zip 2>/dev/null || echo "No zip files found"
+
+          for f in Cannon-Stock-by-GinHalion.zip Cannon-KSU-LKM-by-GinHalion.zip; do
+            if [ -f "/cannon/$f" ]; then
+              echo "✅ 产物存在: /cannon/$f ($(ls -lh "/cannon/$f" | awk '{print $5}'))"
+            else
+              echo "❌ 产物缺失: /cannon/$f"
+              find /cannon -name "*.zip" -type f 2>/dev/null || true
+            fi
+          done
+
+          echo "=== 检查内核镜像 ==="
+          find /cannon -name "Image.gz" -o -name "Image" 2>/dev/null | xargs ls -la 2>/dev/null || true
+
+      - name: 准备 KernelSU 管理器 APK
+        run: |
+          set -ex
+          wget -q --timeout=30 --tries=3 -O /cannon/KernelSU.apk \
+            "https://github.com/tiann/KernelSU/releases/download/v0.9.5/KernelSU_v0.9.5_11872-release.apk"
+          ls -la /cannon/KernelSU.apk
+
+      - name: 生成 Release Tag
+        id: tag
+        run: |
+          echo "tag=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: 创建 GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          release_name: "Cannon Kernel by GinHalion - ${{ steps.tag.outputs.tag }}"
+          body: |
+            Stock | KernelSU v0.9.5 LKM + Manager APK
+
+            构建环境: Ubuntu 22.04
+            构建时间: $(date)
+          draft: false
+          prerelease: false
+
+      - name: 上传 Stock 内核
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: /cannon/Cannon-Stock-by-GinHalion.zip
+          asset_name: Cannon-Kernel-Stock-by-GinHalion.zip
+          asset_content_type: application/zip
+
+      - name: 上传 KernelSU LKM 内核
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: /cannon/Cannon-KSU-LKM-by-GinHalion.zip
+          asset_name: Cannon-Kernel-KSU-v0.9.5-LKM-by-GinHalion.zip
+          asset_content_type: application/zip
+
+      - name: 上传 KernelSU APK
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f /cannon/KernelSU.apk ]; then
+            gh release upload "${{ steps.tag.outputs.tag }}" /cannon/KernelSU.apk --clobber
+            echo "✅ APK uploaded"
+          else
+            echo "⚠️ APK not found, skipping upload"
+          fi
+
+      - name: 上传构建产物为 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cannon-Kernel-Build-${{ steps.tag.outputs.tag }}
+          path: |
+            /cannon/Cannon-Stock-by-GinHalion.zip
+            /cannon/Cannon-KSU-LKM-by-GinHalion.zip
+            /cannon/KernelSU.apk
