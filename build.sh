@@ -1,145 +1,133 @@
-#!/bin/bash
-set -o pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# shellcheck source=scripts/common.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/scripts/common.sh"
+[[ -f $WORK_DIR/resolved-sources.env ]] || die 'Run scripts/prepare.sh before building'
 
-TOOLCHAIN="/cannon"
-KERNEL="$TOOLCHAIN/kernel"
-OUT_DIR="$TOOLCHAIN/out"
-AK_DIR="$TOOLCHAIN/Anykernel3"
-TARGET_IMAGE="$OUT_DIR/arch/arm64/boot/Image.gz"
-PLAIN_ZIP="$TOOLCHAIN/Cannon-Stock-by-GinHalion.zip"
-KSU_LKM_ZIP="$TOOLCHAIN/Cannon-KSU-LKM-by-GinHalion.zip"
+VARIANT=${1:-ksu}
+[[ $VARIANT == ksu || $VARIANT == stock ]] || die 'Usage: bash build.sh [ksu|stock]'
+OUT_DIR="$WORK_DIR/out-$VARIANT"
+export PATH="$TOOLCHAIN_DIR/clang/bin:$TOOLCHAIN_DIR/gcc64/bin:$TOOLCHAIN_DIR/gcc32/bin:$PATH"
+export CCACHE_DIR="${CCACHE_DIR:-$WORK_DIR/.ccache}"
+export CCACHE_BASEDIR="$KERNEL_DIR"
+export KBUILD_BUILD_USER=GinHalion KBUILD_BUILD_HOST=github-actions
+export KBUILD_BUILD_TIMESTAMP
+KBUILD_BUILD_TIMESTAMP=$(git -C "$KERNEL_DIR" show -s --format=%cD HEAD)
 
-export PATH="$TOOLCHAIN/clang/bin:$TOOLCHAIN/gcc64/bin:$TOOLCHAIN/gcc32/bin:$PATH"
-export CCACHE_DIR="$TOOLCHAIN/.ccache"
-GCC64="aarch64-linux-android-"
-GCC32="arm-linux-androideabi-"
-export USE_CCACHE=1
-COMMON_ARGS="ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=$GCC64"
-BUILD_ARGS="CROSS_COMPILE_ARM32=$GCC32 LD=ld.lld KCFLAGS=-Wno-error LOCALVERSION=-GinHalion"
+assert_commit "$KERNEL_DIR" "$KERNEL_COMMIT"
+assert_commit "$WORK_DIR/AnyKernel3" "$ANYKERNEL_COMMIT"
+[[ ! -e $OUT_DIR/.config ]] || die 'Use a fresh output directory for each variant'
+mkdir -p "$OUT_DIR"
 
-mkdir -p "$OUT_DIR" "$CCACHE_DIR"
-ccache -z > /dev/null 2>&1 || true
-ccache -M 50G > /dev/null 2>&1 || true
+make_args=(
+    -C "$KERNEL_DIR" "O=$OUT_DIR" ARCH=arm64
+    CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android-
+    CROSS_COMPILE_ARM32=arm-linux-androideabi- 'CC=ccache clang' HOSTCC=gcc
+    LD=ld.lld KCFLAGS=-Wno-error LOCALVERSION=-GinHalion
+)
 
-# ============================================
-# 清理 SukiSU 残留
-# ============================================
-clean_sukisu() {
-    cd "$KERNEL"
-    rm -rf SukiSU-Ultra KernelSU
-    [ -L drivers/kernelsu ] && rm drivers/kernelsu
-    grep -q "kernelsu" drivers/Makefile 2>/dev/null && sed -i '/kernelsu/d' drivers/Makefile || true
-    grep -q "kernelsu" drivers/Kconfig 2>/dev/null && sed -i '/kernelsu/d' drivers/Kconfig || true
-}
+if [[ $VARIANT == ksu ]]; then
+    assert_commit "$KERNEL_DIR/KernelSU-Next" "$KSU_COMMIT"
+    # Select the snapshot resolved for this run, even if legacy moves mid-build.
+    # Verify checkout because upstream setup.sh can fall back to another branch.
+    (cd "$KERNEL_DIR" && bash "$WORK_DIR/ksu-setup.sh" "$KSU_COMMIT") 2>&1 | tee "$LOG_DIR/ksu-setup.log"
+    assert_commit "$KERNEL_DIR/KernelSU-Next" "$KSU_COMMIT"
+    [[ -L $KERNEL_DIR/drivers/kernelsu ]] || die 'KernelSU driver link was not created'
+    git -C "$KERNEL_DIR" apply --check "$PROJECT_DIR/patches/cannon-ksu-manual-hooks.patch"
+    git -C "$KERNEL_DIR" apply "$PROJECT_DIR/patches/cannon-ksu-manual-hooks.patch"
+else
+    [[ ! -e $KERNEL_DIR/drivers/kernelsu ]] || die 'Build stock before integrating KernelSU'
+fi
 
-# ============================================
-# 编译内核
-# ============================================
-build_kernel() {
-    local OUTPUT_ZIP=$1
-    local LABEL=$2
-    local SUKI_MODE=$3
-
-    echo ""
-    echo "=========================================="
-    echo "  编译: $LABEL"
-    echo "  输出: $OUTPUT_ZIP"
-    echo "=========================================="
-
-    cd "$KERNEL"
-    if git rev-parse --git-dir > /dev/null 2>&1; then
-        echo "[debug] git checkout ."
-        git checkout .
-    fi
-    clean_sukisu
-
-    if [ -n "$SUKI_MODE" ]; then
-        echo "设置 KernelSU (v0.9.5)..."
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/v0.9.5/kernel/setup.sh" | bash -s v0.9.5
-        echo "✅ KernelSU 设置完成"
-    fi
-
-    rm -rf "$OUT_DIR"
-    mkdir -p "$OUT_DIR"
-
-    echo "配置内核..."
-    if ! make -C "$KERNEL" O="$OUT_DIR" $COMMON_ARGS CC="ccache clang" cannon_defconfig; then
-        echo "❌ defconfig 失败"
-        exit 1
-    fi
-    if [ -n "$SUKI_MODE" ] && grep -q "CONFIG_KSU" "$OUT_DIR/.config" 2>/dev/null; then
-        "$KERNEL/scripts/config" --file "$OUT_DIR/.config" --enable KPROBES
-        "$KERNEL/scripts/config" --file "$OUT_DIR/.config" --enable OVERLAY_FS
-        "$KERNEL/scripts/config" --file "$OUT_DIR/.config" --enable KALLSYMS
-        "$KERNEL/scripts/config" --file "$OUT_DIR/.config" --enable KALLSYMS_ALL
-        "$KERNEL/scripts/config" --file "$OUT_DIR/.config" --enable KSU
-        echo "✅ CONFIG_KSU=y + KPROBES + OVERLAY_FS + KALLSYMS_ALL 已确认"
-    fi
-    if ! make -C "$KERNEL" O="$OUT_DIR" $COMMON_ARGS CC="ccache clang" olddefconfig > /dev/null; then
-        echo "❌ olddefconfig 失败"
-        exit 1
-    fi
-
-    echo "开始编译..."
-    START_TIME=$(date +%s)
-
-    if make -C "$KERNEL" O="$OUT_DIR" $COMMON_ARGS CC="ccache clang" $BUILD_ARGS -j$(nproc) Image.gz 2>&1 | tee "/tmp/build_${LABEL}.log"; then
-        END_TIME=$(date +%s)
-        echo "✅ 编译成功 (耗时: $((END_TIME - START_TIME))s)"
-        # LKM 模式下编译 KernelSU 模块
-        if [ -n "$SUKI_MODE" ]; then
-            echo "编译 KernelSU 模块..."
-            make -C "$KERNEL" O="$OUT_DIR" $COMMON_ARGS CC="ccache clang" $BUILD_ARGS -j$(nproc) modules 2>&1 | tee -a "/tmp/build_${LABEL}.log" || echo "⚠️ 模块编译失败（不影响内核）"
+make "${make_args[@]}" "$KERNEL_DEFCONFIG" 2>&1 | tee "$LOG_DIR/$VARIANT-config.log"
+if [[ $VARIANT == ksu ]]; then
+    "$KERNEL_DIR/scripts/config" --file "$OUT_DIR/.config" \
+        --enable KSU --enable KSU_MANUAL_HOOK \
+        --disable KSU_KPROBES_HOOK --disable KSU_SYSCALL_TABLE_HOOK \
+        --disable KSU_DEBUG --enable OVERLAY_FS --enable KALLSYMS \
+        --enable KALLSYMS_ALL --enable SECURITY --enable SECURITY_SELINUX
+fi
+make "${make_args[@]}" olddefconfig 2>&1 | tee -a "$LOG_DIR/$VARIANT-config.log"
+cp "$OUT_DIR/.config" "$LOG_DIR/$VARIANT.config"
+if [[ $VARIANT == ksu ]]; then
+    for config in KSU KSU_MANUAL_HOOK OVERLAY_FS KALLSYMS KALLSYMS_ALL SECURITY SECURITY_SELINUX; do
+        grep -qx "CONFIG_$config=y" "$OUT_DIR/.config" || die "CONFIG_$config=y did not survive olddefconfig"
+    done
+    for config in KSU_KPROBES_HOOK KSU_SYSCALL_TABLE_HOOK KSU_DEBUG; do
+        if grep -q "^CONFIG_$config=" "$OUT_DIR/.config"; then
+            die "Unexpected CONFIG_$config in manual built-in configuration"
         fi
-    else
-        echo "❌ 编译失败"
-        echo "=== 编译日志中的错误 ==="
-        grep -n -i "error" "/tmp/build_${LABEL}.log" | tail -n 30 || true
-        echo "=== 日志末尾 20 行 ==="
-        tail -n 20 "/tmp/build_${LABEL}.log" || true
-        if [ -n "$SUKI_MODE" ]; then clean_sukisu; fi
-        exit 1
+    done
+
+    # Upstream Kbuild edits fs/namespace.c, seccomp.h and SELinux headers while
+    # being parsed. Run that pass BEFORE parallel compilation: otherwise fs/
+    # can already be built when drivers/kernelsu/ adds path_umount, and shared
+    # headers can change after other translation units have consumed them.
+    make -f "$KERNEL_DIR/KernelSU-Next/kernel/Kbuild" \
+        --eval='.PHONY: ksu-backports' --eval='ksu-backports: ; @:' \
+        "srctree=$KERNEL_DIR" "objtree=$OUT_DIR" src=drivers/kernelsu \
+        CONFIG_KSU=y CONFIG_KSU_MANUAL_HOOK=y ksu-backports \
+        2>&1 | tee "$LOG_DIR/ksu-backports.log"
+    grep -q '^int path_umount(' "$KERNEL_DIR/fs/namespace.c" || die 'path_umount backport was not applied'
+    grep -q 'atomic_t filter_count;' "$KERNEL_DIR/include/linux/seccomp.h" || die 'seccomp backport was not applied'
+    DRIVER_VERSION=$(sed -n 's/^-- KernelSU-Next version: \([0-9][0-9]*\)$/\1/p' "$LOG_DIR/ksu-backports.log" | tail -1)
+    [[ $DRIVER_VERSION =~ ^[0-9]+$ ]] || die 'Cannot determine driver version from upstream Kbuild'
+    (( DRIVER_VERSION >= MANAGER_MIN_KERNEL_VERSION )) || die "Manager requires driver >= $MANAGER_MIN_KERNEL_VERSION, got $DRIVER_VERSION"
+    git -C "$KERNEL_DIR" diff --binary > "$LOG_DIR/ksu-effective-source.patch"
+fi
+
+JOBS=${JOBS:-$(nproc)}
+[[ $JOBS =~ ^[1-9][0-9]*$ ]] || die 'JOBS must be a positive integer'
+if ! make "${make_args[@]}" -j"$JOBS" Image.gz 2>&1 | tee "$LOG_DIR/$VARIANT-build.log"; then
+    grep -nEi 'error:|fatal:|undefined reference|No hooks|\*\*\*' "$LOG_DIR/$VARIANT-build.log" | tail -60 || true
+    die "$VARIANT build failed; full log and final .config are preserved"
+fi
+IMAGE="$OUT_DIR/arch/arm64/boot/Image.gz"
+[[ -s $IMAGE ]] || die 'Image.gz is missing or empty'
+gzip -t "$IMAGE"
+if [[ $VARIANT == ksu ]]; then
+    aarch64-linux-android-nm "$OUT_DIR/vmlinux" > "$LOG_DIR/ksu-symbols.txt"
+    for symbol in kernelsu_init path_umount ksu_handle_sys_reboot ksu_handle_execveat_ksud \
+        ksu_handle_execveat_sucompat ksu_handle_vfs_read ksu_handle_newfstat_ret \
+        ksu_handle_stat ksu_handle_faccessat ksu_handle_input_handle_event; do
+        grep -qE " [Tt] $symbol$" "$LOG_DIR/ksu-symbols.txt" || die "Missing built-in KSU symbol: $symbol"
+    done
+fi
+
+STAGE=$(mktemp -d "$WORK_DIR/package-$VARIANT.XXXXXX")
+trap 'rm -rf -- "$STAGE"' EXIT
+# Export only tracked template files, never cached images, modules, or .git.
+git -C "$WORK_DIR/AnyKernel3" archive HEAD | tar -x -C "$STAGE"
+cp "$IMAGE" "$STAGE/Image.gz"
+[[ -f $STAGE/META-INF/com/google/android/update-binary && -f $STAGE/tools/ak3-core.sh ]] || die 'Incomplete AnyKernel3 template'
+grep -qx 'device.name1=cannon' "$STAGE/anykernel.sh" || die 'Wrong AnyKernel3 device configuration'
+grep -qx 'device.name2=cannong' "$STAGE/anykernel.sh" || die 'Wrong AnyKernel3 device alias'
+grep -qx 'do.devicecheck=1' "$STAGE/anykernel.sh" || die 'AnyKernel3 device check must be enabled'
+if [[ $VARIANT == ksu ]]; then
+    NAME=Cannon-KernelSU-Next-legacy-built-in-by-GinHalion
+else
+    NAME=Cannon-Stock-by-GinHalion
+fi
+sed -i "s/^kernel.string=.*/kernel.string=$NAME/" "$STAGE/anykernel.sh"
+{
+    printf 'device=cannon,cannong\nvariant=%s\n' "$VARIANT"
+    printf 'integration=%s\n' "$([[ $VARIANT == ksu ]] && echo built-in-manual || echo stock)"
+    printf 'kernel=%s\nanykernel=%s\n' "$KERNEL_COMMIT" "$ANYKERNEL_COMMIT"
+    if [[ $VARIANT == ksu ]]; then
+        printf 'kernelsu_next=%s\nsource_mode=%s\n' "$KSU_COMMIT" "$KSU_SOURCE_MODE"
+        printf 'driver_version=%s\nmanager=%s\nuapi=%s\n' "$DRIVER_VERSION" "$MANAGER_VERSION" "$KSU_UAPI_VERSION"
+        printf 'manager_sha256=%s\n' "$MANAGER_SHA256"
     fi
-
-    if [ ! -f "$TARGET_IMAGE" ]; then
-        echo "❌ 内核镜像不存在"
-        if [ -n "$SUKI_MODE" ]; then clean_sukisu; fi
-        exit 1
-    fi
-
-    ls -lh "$TARGET_IMAGE"
-
-    echo "打包中..."
-    cd "$AK_DIR"
-    rm -f Image.gz *.zip
-    cp "$TARGET_IMAGE" "$AK_DIR/Image.gz"
-    # 如果存在 KernelSU 模块则一并打包
-    local KSU_KO="$OUT_DIR/drivers/kernelsu/kernelsu.ko"
-    [ -f "$KSU_KO" ] && cp "$KSU_KO" "$AK_DIR/" && echo "✅ 已包含 kernelsu.ko"
-    zip -r9 "$OUTPUT_ZIP" . -x ".git/*" "*.git*" "README.md" "LICENSE" "*.zip" > /dev/null
-
-    echo "✅ 完成: $OUTPUT_ZIP"
-    ls -lh "$OUTPUT_ZIP"
-
-    rm -f "$AK_DIR/Image.gz"
-    if [ -n "$SUKI_MODE" ]; then clean_sukisu; fi
-}
-
-# ============================================
-# 主流程
-# ============================================
-echo "=========================================="
-echo "  Cannon Kernel by GinHalion"
-echo "=========================================="
-echo "时间: $(date)  |  CPU: $(nproc)"
-
-build_kernel "$PLAIN_ZIP"     "Stock"      "" || exit 1
-build_kernel "$KSU_LKM_ZIP" "KernelSU LKM" "lkm" || exit 1
-
-echo ""
-echo "=========================================="
-echo "  All builds completed!"
-echo "=========================================="
-echo "  Stock:      $PLAIN_ZIP"
-echo "  KernelSU LKM: $KSU_LKM_ZIP"
-echo "=========================================="
+    printf 'build_repository_commit=%s\n' "$(git -C "$PROJECT_DIR" rev-parse HEAD)"
+    printf 'clang=%s\n' "$(clang --version | sed -n '1p')"
+    printf 'image_sha256=%s\n' "$(sha256sum "$IMAGE" | cut -d ' ' -f 1)"
+} > "$STAGE/build-info.txt"
+cp "$STAGE/build-info.txt" "$DIST_DIR/$VARIANT-build-info.txt"
+[[ ! -e $DIST_DIR/$NAME.zip ]] || die 'Refusing to update an existing output ZIP'
+(cd "$STAGE" && zip -r9 "$DIST_DIR/$NAME.zip" . -x '.git/*' 'README.md' 'LICENSE' '*.zip') > "$LOG_DIR/$VARIANT-package.log"
+unzip -tq "$DIST_DIR/$NAME.zip"
+unzip -Z1 "$DIST_DIR/$NAME.zip" > "$LOG_DIR/$VARIANT-package-contents.txt"
+grep -qx Image.gz "$LOG_DIR/$VARIANT-package-contents.txt" || die 'Packaged kernel image is missing'
+[[ $(unzip -p "$DIST_DIR/$NAME.zip" Image.gz | sha256sum | cut -d ' ' -f 1) == "$(sha256sum "$IMAGE" | cut -d ' ' -f 1)" ]] || die 'Packaged image checksum mismatch'
+ccache --show-stats
+ls -lh "$DIST_DIR/$NAME.zip"
